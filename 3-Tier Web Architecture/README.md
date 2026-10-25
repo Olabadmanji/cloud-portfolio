@@ -1,160 +1,76 @@
-Enterprise 3-Tier Web Architecture on AWS
+# AWS Production-Grade 3-Tier Web Architecture
 
-## Project Overview
+A highly available, fault-tolerant, and secure 3-tier web architecture deployed in the AWS London region (`eu-west-2`). This project demonstrates core cloud networking and security principles by separating the presentation, application, and data layers into isolated network segments.
 
-This project implements a highly available, fault-tolerant, and secure 3-tier web architecture on AWS. The infrastructure is designed according to AWS best practices and aligns with the AWS Well-Architected Framework pillars, particularly **Security, Reliability, and Operational Excellence**.
+The environment automatically scales based on traffic demands, utilizes an Application Load Balancer for traffic distribution, and leverages a Multi-AZ RDS deployment for database failover redundancy.
 
-The architecture separates the presentation, application, and database layers to ensure scalability, maintainability, and security.
+## Architecture Topology
 
----
+*(Insert your VPC Resource Map screenshot here)*
 
-## Architecture Components
+* **Region:** `eu-west-2` (London)
+* **VPC CIDR:** `10.0.0.0/16`
+* **Availability Zones:** `eu-west-2a`, `eu-west-2b`
+* **Subnet Partitioning:**
+* 2x Public Subnets (Presentation Tier) - `/20`
+* 2x Private App Subnets (Application Tier) - `/20`
+* 2x Private DB Subnets (Data Tier) - `/20`
 
-### 1. Network Layer – Amazon VPC
 
-* Custom Virtual Private Cloud spanning two Availability Zones
-* Public and private subnet segmentation
-* Internet Gateway for public connectivity
-* NAT Gateway for controlled outbound internet access
 
-The network is designed with strict isolation between public-facing and private resources.
+## Core Technologies Used
 
----
+* **Compute:** Amazon EC2 (Amazon Linux 2023), Auto Scaling Groups, Launch Templates
+* **Networking:** Amazon VPC, Internet Gateway, NAT Gateways, Application Load Balancer (ALB)
+* **Database:** Amazon RDS (MySQL 8.0, Multi-AZ)
+* **Security:** Chained Security Groups, IAM Roles, AWS Systems Manager (Session Manager)
+* **Application Stack:** Apache (httpd), PHP, MySQLi
 
-### 2. Load Balancing – Application Load Balancer
+## Security & Network Design
 
-* Internet-facing Application Load Balancer deployed in public subnets
-* Routes HTTP/HTTPS traffic to private EC2 instances
-* Performs continuous health checks
-* Integrated with AWS WAF
+This architecture enforces strict network isolation and the principle of least privilege:
 
-The ALB distributes incoming traffic across multiple application instances to ensure high availability.
+1. **Public Tier:** Only the Application Load Balancer (ALB) and NAT Gateways reside in the public subnets. They possess auto-assigned public IPs and route directly to the Internet Gateway.
+2. **Private App Tier:** EC2 instances reside in private subnets with no direct inbound internet access. Outbound internet access (for package updates like Apache/PHP) is strictly routed through the NAT Gateways.
+3. **Private Data Tier:** The RDS database subnets are completely isolated. Their route tables contain only local VPC routes, with the NAT Gateway routes explicitly removed to guarantee no internet egress.
+4. **Chained Security Groups:**
+* `prod-alb-sg`: Accepts HTTP (Port 80) from `0.0.0.0/0`.
+* `prod-app-sg`: Accepts HTTP (Port 80) **only** from `prod-alb-sg`.
+* `prod-db-sg`: Accepts MySQL (Port 3306) **only** from `prod-app-sg`.
 
----
 
-### 3. Compute Layer – EC2 & Auto Scaling Group
 
-* EC2 instances deployed in private subnets
-* Managed by an Auto Scaling Group
-* Launch Template used for standardized instance configuration
-* Automated scaling based on traffic demand
+## Deployment Phases
 
-The Auto Scaling Group ensures elasticity and automatic replacement of unhealthy instances.
+### Phase 1: Network Foundation
 
-The EC2 instances are configured using a bootstrap script (`scripts/user_data.sh`) executed at launch time. This script installs required packages, retrieves secure parameters from AWS Systems Manager, and configures the web server automatically. This ensures immutable, repeatable, and automated instance provisioning without manual SSH configuration.
+Built the base VPC using a 1-to-1 route table mapping for the private tiers to ensure granular routing control. Provisioned the Internet Gateway and deployed NAT Gateways into each public subnet for Multi-AZ egress redundancy.
 
----
+### Phase 2: Compute & Load Balancing
 
-### 4. Database Layer – Amazon RDS (MySQL)
+Configured the chained security groups. Created an EC2 Launch Template (`t2.micro`) utilizing a User Data script to bootstrap the Apache server and inject a dynamic PHP script for database connection testing. Provisioned the internet-facing Application Load Balancer and Target Group.
 
-* Amazon RDS MySQL instance deployed in private database subnets
-* Dedicated DB Subnet Group
-* Associated with restrictive security groups
-* Automated backups enabled
+### Phase 3: Data Tier & Auto Scaling
 
-In a production environment, Multi-AZ deployment would be enabled for high availability and automatic failover.
+Created a dedicated DB Subnet Group and deployed a Multi-AZ RDS MySQL database to ensure synchronous standby replication. Deployed the Auto Scaling Group (ASG) into the private app subnets, configured with Target Tracking scaling policies (50% CPU utilization) and ELB health checks for automated instance replacement.
 
----
+## Proof of Functionality
 
-### 5. Secure Outbound Connectivity – NAT Gateway
+### 1. Load Balancing & Target Health
 
-* NAT Gateway deployed in public subnet
-* Enables private EC2 instances to access the internet for updates and patches
-* Prevents inbound internet access to private resources
+*(Insert your screenshot of the Target Group showing 2 "Healthy" targets in different AZs here)*
 
----
+The ASG successfully provisions instances into the private subnets. The instances successfully communicate outbound via NAT Gateways to install PHP/Apache, and the ALB successfully routes inbound health checks to them.
 
-### 6. Secrets Management – AWS Systems Manager Parameter Store
+### 2. High Availability & Dynamic Database Connection
 
-* Database credentials stored as encrypted `SecureString` parameters
-* IAM Role attached to EC2 instances
-* Secure retrieval of secrets during instance boot
+*(Insert your side-by-side browser screenshots of the ALB URL showing the different IP hostnames here)*
 
-This approach prevents hardcoded credentials and enforces least-privilege access.
+The PHP application dynamically queries the Multi-AZ RDS database and fetches the EC2 internal hostname. Refreshing the ALB DNS URL demonstrates round-robin traffic distribution across different underlying web servers in multiple Availability Zones.
 
----
+## Future Enhancements
 
-### 7. Edge Optimization & Security – CloudFront & AWS WAF
-
-* Amazon CloudFront distribution for global content delivery
-* AWS Web Application Firewall attached for application-layer protection
-* Protection against common OWASP threats (e.g., SQL injection, XSS)
-* Reduced latency via edge caching
-
----
-
-## Security Design
-
-* Layered security using cascading Security Groups
-* ALB accessible from the internet (Port 80/443)
-* Application tier accepts traffic only from ALB Security Group
-* Database tier accepts traffic only from Application Security Group
-* IAM roles used instead of embedded credentials
-
----
-
-## Deployment Process
-
-### Phase 1 – Network & Security Foundation
-
-1. Provisioned VPC, subnets, route tables, Internet Gateway, and NAT Gateway
-2. Configured cascading Security Groups:
-
-   * `ALB-SG`: Allows inbound HTTP/HTTPS from 0.0.0.0/0
-   * `App-SG`: Allows HTTP from `ALB-SG` only
-   * `DB-SG`: Allows MySQL (3306) from `App-SG` only
-
----
-
-### Phase 2 – Database & Secrets Configuration
-
-1. Stored RDS master password in SSM Parameter Store (SecureString)
-2. Deployed RDS MySQL instance within private DB subnets
-3. Attached appropriate security groups
-
----
-
-### Phase 3 – Compute & Edge Deployment
-
-1. Created EC2 Launch Template with `user_data.sh` for Apache installation and SSM secret retrieval
-2. Configured Auto Scaling Group across private subnets
-3. Deployed Application Load Balancer
-4. Attached AWS WAF
-5. Configured CloudFront distribution for global traffic routing
-
----
-
-## Troubleshooting & Resolution
-
-### Issue: Target Group Health Checks Failing
-
-The Application Load Balancer marked backend EC2 instances as unhealthy.
-
-**Investigation Steps:**
-
-* Reviewed EC2 instance system logs
-* Verified security group configurations
-* Checked IAM role permissions
-
-**Root Cause:**
-The EC2 instances did not have the required IAM role (`AmazonSSMManagedInstanceCore`) to retrieve the encrypted database password from AWS Systems Manager Parameter Store. The failure caused the startup script to terminate before the web server installation completed.
-
-**Resolution:**
-
-* Updated the Launch Template with the correct IAM Instance Profile
-* Terminated unhealthy instances
-* Auto Scaling Group launched new healthy instances
-
----
-
-## Key Features Demonstrated
-
-* Multi-AZ high availability design
-* Infrastructure security using least privilege principles
-* Elastic scaling architecture
-* Secure secrets management
-* Layer 7 traffic routing
-* Global content delivery with edge caching
-* Production-style troubleshooting workflow
+* **Amazon Route 53 & ACM:** Register a custom domain name to route to the ALB and attach an SSL/TLS certificate via AWS Certificate Manager to secure traffic over HTTPS (Port 443).
+* **AWS Secrets Manager:** Remove the database password from the EC2 Launch Template User Data script and transition to dynamic credential fetching using an attached IAM instance profile.
 
 ---
