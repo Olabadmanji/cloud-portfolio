@@ -1,0 +1,15 @@
+# Local .terraform directories
+**/.terraform/*
+
+# .tfstate files
+*.tfstate
+*.tfstate.*
+
+# Crash log files
+crash.log
+crash.*.log
+
+# Ignore variables file containing your RDS password
+terraform.tfvars
+terraform.tfvars.json
+*.auto.tfvars
