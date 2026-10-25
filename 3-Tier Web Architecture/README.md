@@ -6,7 +6,7 @@ The environment automatically scales based on traffic demands, utilizes an Appli
 
 ## Architecture Topology
 
-*(Insert your VPC Resource Map screenshot here)*
+![VPC Resource Map](./architecture-map.jpg)
 
 * **Region:** `eu-west-2` (London)
 * **VPC CIDR:** `10.0.0.0/16`
@@ -58,13 +58,14 @@ Created a dedicated DB Subnet Group and deployed a Multi-AZ RDS MySQL database t
 
 ### 1. Load Balancing & Target Health
 
-*(Insert your screenshot of the Target Group showing 2 "Healthy" targets in different AZs here)*
+![Target Group Health](./target-group-health.jpg)
 
 The ASG successfully provisions instances into the private subnets. The instances successfully communicate outbound via NAT Gateways to install PHP/Apache, and the ALB successfully routes inbound health checks to them.
 
 ### 2. High Availability & Dynamic Database Connection
 
-*(Insert your side-by-side browser screenshots of the ALB URL showing the different IP hostnames here)*
+![Live Traffic IP 1](./live-traffic-1.jpg)
+![Live Traffic IP 2](./live-traffic-2.jpg)
 
 The PHP application dynamically queries the Multi-AZ RDS database and fetches the EC2 internal hostname. Refreshing the ALB DNS URL demonstrates round-robin traffic distribution across different underlying web servers in multiple Availability Zones.
 
