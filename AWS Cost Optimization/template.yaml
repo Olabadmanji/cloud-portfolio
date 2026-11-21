@@ -1,0 +1,241 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  FinOps Cost Optimization Dashboard: Automated daily AWS spend monitoring
+  using EventBridge Scheduler, Lambda, Cost Explorer API (top-3 service
+  breakdown and month-end forecasting), SNS alerting, and CloudWatch
+  observability.
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: Email address to receive FinOps cost and error alerts.
+  BudgetThreshold:
+    Type: Number
+    Default: 10
+    Description: Monthly spend threshold in USD (alerts at 80% MTD or 100% forecast).
+  DashboardName:
+    Type: String
+    Default: Cost-Optimization-Dashboard
+    Description: Name for the CloudWatch dashboard.
+
+Resources:
+  CostAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-alerts"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  CostMonitorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-monitor-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: cost-opt-least-privilege
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ce:GetCostAndUsage
+                  - ce:GetCostForecast
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref CostAlertTopic
+
+  CostMonitorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-monitor-fn"
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 30
+      Role: !GetAtt CostMonitorRole.Arn
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref CostAlertTopic
+          BUDGET_THRESHOLD: !Ref BudgetThreshold
+      Code:
+        ZipFile: |
+          import os, json, boto3
+          from datetime import datetime, timedelta, timezone
+          from botocore.exceptions import ClientError
+
+          ce = boto3.client("ce", region_name="us-east-1")
+          cw = boto3.client("cloudwatch")
+          sns = boto3.client("sns")
+
+          SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
+          BUDGET_THRESHOLD = float(os.environ.get("BUDGET_THRESHOLD", "10.0"))
+
+          def get_next_month_start(today):
+              if today.month == 12:
+                  return today.replace(year=today.year + 1, month=1, day=1)
+              return today.replace(month=today.month + 1, day=1)
+
+          def lambda_handler(event, context):
+              today = datetime.now(timezone.utc).date()
+              start_of_month = today.replace(day=1)
+              start_date = (today - timedelta(days=1)).strftime("%Y-%m-%d") if today == start_of_month else start_of_month.strftime("%Y-%m-%d")
+              end_date = today.strftime("%Y-%m-%d")
+
+              usage_resp = ce.get_cost_and_usage(
+                  TimePeriod={"Start": start_date, "End": end_date},
+                  Granularity="MONTHLY",
+                  Metrics=["UnblendedCost"],
+                  GroupBy=[{"Type": "DIMENSION", "Key": "SERVICE"}],
+              )
+
+              service_costs, mtd_cost = [], 0.0
+              for g in usage_resp["ResultsByTime"][0].get("Groups", []):
+                  amt = float(g["Metrics"]["UnblendedCost"]["Amount"])
+                  mtd_cost += amt
+                  if amt > 0:
+                      service_costs.append((g["Keys"][0], amt))
+              service_costs.sort(key=lambda x: x[1], reverse=True)
+              top_3 = service_costs[:3]
+
+              forecasted_cost = None
+              try:
+                  f_resp = ce.get_cost_forecast(
+                      TimePeriod={"Start": today.strftime("%Y-%m-%d"), "End": get_next_month_start(today).strftime("%Y-%m-%d")},
+                      Metric="UNBLENDED_COST",
+                      Granularity="MONTHLY",
+                  )
+                  forecasted_cost = float(f_resp["Total"]["Amount"])
+              except ClientError as e:
+                  print(f"Forecast unavailable: {e.response['Error']['Message']}")
+
+              pct_used = (mtd_cost / BUDGET_THRESHOLD) * 100 if BUDGET_THRESHOLD > 0 else 0
+              metrics = [
+                  {"MetricName": "MonthToDateSpend", "Value": round(mtd_cost, 4), "Unit": "None"},
+                  {"MetricName": "BudgetUtilizationPercent", "Value": round(pct_used, 2), "Unit": "Percent"},
+              ]
+              if forecasted_cost is not None:
+                  metrics.append({"MetricName": "ForecastedMonthEndSpend", "Value": round(forecasted_cost, 4), "Unit": "None"})
+              cw.put_metric_data(Namespace="Custom/CostOptimization", MetricData=metrics)
+
+              if mtd_cost >= BUDGET_THRESHOLD * 0.8 or (forecasted_cost is not None and forecasted_cost > BUDGET_THRESHOLD):
+                  top_txt = "\n".join([f"  - {s}: ${c:.4f}" for s, c in top_3]) if top_3 else "  - None"
+                  f_txt = f"${forecasted_cost:.2f}" if forecasted_cost is not None else "Unavailable"
+                  sns.publish(
+                      TopicArn=SNS_TOPIC_ARN,
+                      Subject=f"AWS FinOps Alert: MTD ${mtd_cost:.2f} / Budget ${BUDGET_THRESHOLD:.2f}",
+                      Message=f"Period: {start_date} to {end_date}\nMTD Spend: ${mtd_cost:.4f} ({pct_used:.1f}%)\nForecast: {f_txt}\nBudget: ${BUDGET_THRESHOLD:.2f}\n\nTop Services:\n{top_txt}",
+                  )
+
+              return {"statusCode": 200, "body": json.dumps({"mtd_cost": round(mtd_cost, 4), "forecasted_cost": forecasted_cost, "top_3_services": top_3})}
+
+  SchedulerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-scheduler-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeCostMonitorLambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt CostMonitorFunction.Arn
+
+  DailyCostCheckSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${AWS::StackName}-daily-trigger"
+      Description: Triggers the FinOps Cost Optimization Lambda once per day.
+      ScheduleExpression: rate(1 day)
+      State: ENABLED
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt CostMonitorFunction.Arn
+        RoleArn: !GetAtt SchedulerExecutionRole.Arn
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-lambda-errors-alarm"
+      AlarmDescription: Triggers if the Cost Optimization Lambda fails.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CostMonitorFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref CostAlertTopic
+
+  CostOptimizationDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Ref DashboardName
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "metrics": [
+                  ["Custom/CostOptimization", "MonthToDateSpend"],
+                  ["Custom/CostOptimization", "ForecastedMonthEndSpend"]
+                ],
+                "period": 86400,
+                "stat": "Maximum",
+                "region": "${AWS::Region}",
+                "title": "MTD vs Forecasted AWS Spend (USD)"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "metrics": [["Custom/CostOptimization", "BudgetUtilizationPercent"]],
+                "period": 86400,
+                "stat": "Maximum",
+                "region": "${AWS::Region}",
+                "title": "Budget Utilization (%)",
+                "view": "singleValue"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  RegionDeployed:
+    Value: !Ref AWS::Region
+  LambdaFunctionName:
+    Value: !Ref CostMonitorFunction
+  SNSTopicArn:
+    Value: !Ref CostAlertTopic
+  ScheduleName:
+    Value: !Ref DailyCostCheckSchedule
+  DashboardName:
+    Value: !Ref CostOptimizationDashboard
